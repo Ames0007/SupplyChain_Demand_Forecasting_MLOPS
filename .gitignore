@@ -26,6 +26,8 @@ monitoring/evidently_reports/*.json
 # Env
 .env
 .env.*
+.venv/
+venv/
 
 # IDE
 .vscode/

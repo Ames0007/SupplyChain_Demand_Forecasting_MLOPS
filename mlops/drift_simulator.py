@@ -132,7 +132,7 @@ def run_drift_demo(
 
     print("\n=== DRIFT DEMO RESULTS ===")
     print(json.dumps(summary, indent=2, default=str))
-    print(f"\nDrift Demo Report → {html_report_path}")
+    print(f"\nDrift Demo Report -> {html_report_path}")
 
     return summary
 

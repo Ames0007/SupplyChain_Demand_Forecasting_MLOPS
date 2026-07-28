@@ -31,6 +31,23 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── artifact bootstrap ──────────────────────────────────────────────────────
+# data/raw/ and data/features/ are gitignored (generated, not tracked in git).
+# On a fresh deploy (Streamlit Cloud does a clean `git clone`) they don't
+# exist yet. Regenerate them via the project's real pipeline — the synthetic
+# generator + the real feature store + the real models/eval code — instead
+# of crashing on FileNotFoundError. No-op once the files exist.
+
+
+@st.cache_resource(show_spinner="Bootstrapping feature store (first run only)…")
+def _bootstrap_artifacts() -> None:
+    from mlops.bootstrap_artifacts import ensure_artifacts
+
+    ensure_artifacts()
+
+
+_bootstrap_artifacts()
+
 # ── theme / CSS ───────────────────────────────────────────────────────────────
 
 st.markdown("""
@@ -645,9 +662,11 @@ elif page.endswith("Drift Monitor"):
 elif page.endswith("SKU Analytics"):
     st.markdown("## SKU Analytics")
 
-    features = load_features()
-    meta = load_metadata()
-    merged = features.merge(meta[["sku_id", "category", "supplier_region", "unit_cost"]], on="sku_id", how="left")
+    # category / supplier_region / unit_cost are already embedded in the feature
+    # store output (features/feature_store.py merges SKU metadata in at generation
+    # time), so no re-merge is needed here — merging sku_metadata.csv again on
+    # top of that collided the column names into category_x/category_y.
+    merged = load_features()
 
     tab1, tab2, tab3 = st.tabs(["Demand Patterns", "Zero-Demand Analysis", "Regional Breakdown"])
 

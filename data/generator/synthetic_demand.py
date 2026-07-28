@@ -238,7 +238,7 @@ def _print_summary(demand: pd.DataFrame, metadata: pd.DataFrame) -> None:
     print("\n=== Dataset Summary ===")
     print(f"  Total rows:     {len(demand):,}")
     print(f"  SKUs:           {demand['sku_id'].nunique()}")
-    print(f"  Date range:     {demand['week'].min()} → {demand['week'].max()}")
+    print(f"  Date range:     {demand['week'].min()} -> {demand['week'].max()}")
     print(f"  Missing demand: {demand['demand'].isna().mean():.2%}")
     print(f"  Zero demand:    {(demand['demand'] == 0).mean():.2%}")
     print(f"\n  By category:")
