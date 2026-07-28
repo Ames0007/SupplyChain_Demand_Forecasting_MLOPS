@@ -91,7 +91,10 @@ def _load_model_and_features() -> None:
     else:
         _APP_STATE["metadata_df"] = pd.DataFrame(columns=["sku_id", "category", "supplier_region"])
 
-    # Load model from MLflow or local fallback
+    # Load model from MLflow, or fall back to the locally bootstrapped one.
+    _APP_STATE["model"] = None
+    _APP_STATE["model_version"] = None
+
     try:
         from mlops.model_registry import get_production_version
         from mlops.mlflow_config import REGISTERED_MODEL_NAME
@@ -104,21 +107,31 @@ def _load_model_and_features() -> None:
 
             # Wrap in QuantileLightGBM interface for predict()
             from models.tree_models import QuantileLightGBM
-            q_model = QuantileLightGBM(feature_cols=store.feature_cols)
+            q_model = QuantileLightGBM(feature_cols=store.feature_columns)
             q_model._models["p50"] = lgb_model
             # P10/P90 will be approximated if only P50 loaded — warn once
             logger.warning("Only P50 model loaded from registry. P10/P90 will be approximated.")
             _APP_STATE["model"] = q_model
             _APP_STATE["model_version"] = f"v{version}"
         else:
-            logger.warning("No Production model in MLflow registry — model not loaded")
-            _APP_STATE["model"] = None
-            _APP_STATE["model_version"] = None
+            logger.warning("No Production model in MLflow registry")
 
     except Exception as exc:
         logger.error("MLflow model load failed: %s", exc)
-        _APP_STATE["model"] = None
-        _APP_STATE["model_version"] = None
+
+    if _APP_STATE["model"] is None:
+        # ensure_artifacts() (called earlier in lifespan()) trains and saves
+        # this whenever the MLflow registry has no Production model, so it
+        # should always be available here on a fresh deployment.
+        from mlops.bootstrap_artifacts import load_local_production_model
+
+        local_model = load_local_production_model()
+        if local_model is not None:
+            _APP_STATE["model"] = local_model
+            _APP_STATE["model_version"] = "local-fallback"
+            logger.info("Loaded local fallback QuantileLightGBM (no MLflow Production model available)")
+        else:
+            logger.error("No model available from MLflow or local fallback — /forecast will return 503")
 
     # Check drift alert status
     from pathlib import Path as _Path
