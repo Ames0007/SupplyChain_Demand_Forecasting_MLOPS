@@ -1,0 +1,82 @@
+version: "3.8"
+
+services:
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.mlflow
+    container_name: demand-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: demand-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./monitoring:/app/monitoring
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: demand-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./monitoring:/app/monitoring
+      - mlflow-data:/mlflow
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    depends_on:
+      - mlflow
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+
+  evidently:
+    image: nginx:alpine
+    container_name: demand-evidently
+    ports:
+      - "8502:80"
+    volumes:
+      - ./monitoring/evidently_reports:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:80"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mlflow-data:

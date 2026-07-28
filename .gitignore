@@ -1,0 +1,45 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data (generated — not tracked in git)
+data/raw/
+data/features/
+mlruns/
+mlflow.db
+
+# Model artifacts
+*.pkl
+*.joblib
+*.pt
+*.pth
+
+# Evidently HTML reports (generated)
+monitoring/evidently_reports/*.html
+monitoring/evidently_reports/*.json
+
+# Env
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Claude Code project files
+.claude/

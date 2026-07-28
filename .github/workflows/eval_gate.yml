@@ -1,0 +1,81 @@
+name: Evaluation Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy scikit-learn pyarrow \
+                      lightgbm xgboost \
+                      fastapi uvicorn httpx pydantic \
+                      pytest pytest-cov anyio
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Generate data and check quality
+        run: |
+          python data/generator/synthetic_demand.py
+          python -c "
+          import pandas as pd
+          df = pd.read_csv('data/raw/demand_history.csv', parse_dates=['week'])
+          meta = pd.read_csv('data/raw/sku_metadata.csv')
+          assert len(df) == 78000,    f'Expected 78000 rows, got {len(df)}'
+          assert len(meta) == 500,    f'Expected 500 SKUs, got {len(meta)}'
+          assert df['sku_id'].nunique() == 500
+          assert df['demand'].isna().mean() < 0.05, 'Too many missing values'
+          print(f'Data quality OK — {len(df):,} rows, {meta[\"category\"].value_counts().to_dict()}')
+          "
+
+      - name: Run baseline evaluation gate
+        run: |
+          python -c "
+          import sys, pandas as pd
+          from features.feature_store import DemandFeatureStore
+          from models.baselines import SeasonalNaiveForecaster, MovingAverageForecaster
+          from training.evaluate import compute_metrics
+
+          demand = pd.read_csv('data/raw/demand_history.csv', parse_dates=['week'])
+          meta   = pd.read_csv('data/raw/sku_metadata.csv')
+
+          store = DemandFeatureStore()
+          df = store.generate_features(demand, meta).dropna(subset=['demand'])
+          store.save(df, 'v1')
+
+          sorted_weeks = sorted(df['week'].unique())
+          cutoff = sorted_weeks[-13]
+          train = df[df['week'] < cutoff]
+          test  = df[df['week'] >= cutoff]
+
+          ma = MovingAverageForecaster(window=4)
+          ma.fit(train)
+          preds  = ma.predict(train, horizon=13)
+          merged = test[['sku_id','week','demand']].merge(preds, on=['sku_id','week'], how='inner')
+          baseline_wape = compute_metrics(merged['demand'].values, merged['p50'].values)['wape']
+
+          # Gate: baseline must be sane (< 90%) — proves data pipeline is healthy
+          threshold = 90.0
+          print(f'Moving Average WAPE: {baseline_wape:.2f}%  (gate: < {threshold}%)')
+          if baseline_wape >= threshold:
+              print('FAIL: baseline WAPE unexpectedly high — data pipeline may be broken')
+              sys.exit(1)
+          print('PASS')
+          "

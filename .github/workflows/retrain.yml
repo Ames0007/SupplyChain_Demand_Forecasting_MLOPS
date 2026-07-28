@@ -1,0 +1,101 @@
+name: Scheduled Retraining
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"   # Every Sunday midnight UTC
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual retrain"
+        required: false
+        default: "manual trigger"
+  workflow_call:
+    inputs:
+      reason:
+        description: "Reason for triggered retrain"
+        required: false
+        type: string
+        default: "drift-triggered"
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pandas numpy scikit-learn pyarrow \
+                      lightgbm xgboost \
+                      fastapi httpx pydantic \
+                      mlflow
+
+      - name: Generate data
+        run: python data/generator/synthetic_demand.py
+
+      - name: Generate features
+        run: |
+          python -c "
+          import pandas as pd
+          from features.feature_store import DemandFeatureStore
+          demand = pd.read_csv('data/raw/demand_history.csv', parse_dates=['week'])
+          meta   = pd.read_csv('data/raw/sku_metadata.csv')
+          store  = DemandFeatureStore()
+          store.save(store.generate_features(demand, meta), 'v1')
+          print('Features saved: v1')
+          "
+
+      - name: Start MLflow server
+        run: |
+          mlflow server --host 127.0.0.1 --port 5001 \
+            --backend-store-uri sqlite:///mlflow.db \
+            --default-artifact-root ./mlruns &
+          sleep 6
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5001
+
+      - name: Train candidate model
+        id: train
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5001
+        run: |
+          python training/train.py --feature-version v1 --model quantile_lgbm 2>&1 | tee train.log
+          RUN_ID=$(grep -oP "run_id=\K[a-f0-9]+" train.log | tail -1)
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Candidate run_id: $RUN_ID"
+
+      - name: Run promotion gate
+        id: promote
+        env:
+          MLFLOW_TRACKING_URI: http://127.0.0.1:5001
+        run: |
+          RUN_ID="${{ steps.train.outputs.run_id }}"
+          if [ -n "$RUN_ID" ]; then
+            python training/promote_model.py \
+              --run-id "$RUN_ID" --metric wape --threshold 0.02 \
+              && echo "promoted=true" >> $GITHUB_OUTPUT \
+              || echo "promoted=false" >> $GITHUB_OUTPUT
+          else
+            echo "No run_id found — skipping promotion"
+            echo "promoted=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Summary
+        run: |
+          PROMOTED="${{ steps.promote.outputs.promoted }}"
+          REASON="${{ github.event.inputs.reason || 'scheduled' }}"
+          if [ "$PROMOTED" = "true" ]; then
+            echo "### ✅ New model promoted to Production" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ⏸️ Candidate rejected — production model unchanged" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Trigger:** $REASON" >> $GITHUB_STEP_SUMMARY
