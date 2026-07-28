@@ -35,12 +35,20 @@ def get_app_state() -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load model and features on startup; clean up on shutdown."""
+    """Bootstrap data artifacts, then load model and features on startup; clean up on shutdown."""
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
     startup_time = time.time()
     logger.info("Starting demand forecasting API...")
+
+    try:
+        from mlops.bootstrap_artifacts import ensure_artifacts
+
+        ensure_artifacts()
+    except Exception as exc:
+        logger.error("Artifact bootstrap failed: %s", exc)
+        logger.warning("Continuing startup — _load_model_and_features will run in degraded mode")
 
     try:
         _load_model_and_features()
