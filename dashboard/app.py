@@ -10,6 +10,7 @@ Built on real data from the production training run:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from plotly.subplots import make_subplots
 
@@ -47,6 +49,69 @@ def _bootstrap_artifacts() -> None:
 
 
 _bootstrap_artifacts()
+
+# ── API client ───────────────────────────────────────────────────────────────
+# The dashboard is a thin client for whatever maps cleanly onto the deployed
+# forecasting API: Forecast Explorer's model predictions, drift status, and
+# live health. Pages that need the full historical feature store or the
+# multi-model leaderboard (Overview, Model Leaderboard, SKU Analytics,
+# Feature Importance) still read the local self-healing feature store —
+# no existing endpoint serves bulk historical data, a model comparison
+# table, or feature importances, so there's nothing to point them at.
+#
+# Change API_BASE_URL — or set the API_BASE_URL environment variable — to
+# point this dashboard at a different deployment. No other code changes
+# needed anywhere else in this file.
+API_BASE_URL = os.environ.get(
+    "API_BASE_URL", "https://supplychain-demand-forecasting-mlops.onrender.com"
+).rstrip("/")
+
+API_TIMEOUT_S = 60  # Render's free tier can take ~30-60s to wake from a cold start
+
+
+def _api_request(method: str, path: str, **kwargs) -> tuple[dict | None, str | None]:
+    """Call the forecasting API. Returns (json_body, error_message) — never raises."""
+    url = f"{API_BASE_URL}{path}"
+    try:
+        resp = requests.request(method, url, timeout=API_TIMEOUT_S, **kwargs)
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.Timeout:
+        return None, f"Timed out waiting for {url} (Render's free tier may be cold-starting — try again)"
+    except requests.exceptions.ConnectionError:
+        return None, f"Could not connect to {url}"
+    except requests.exceptions.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.response.json().get("detail", "")
+        except Exception:
+            pass
+        status = exc.response.status_code
+        return None, f"{status} {exc.response.reason}" + (f" — {detail}" if detail else "")
+    except requests.exceptions.RequestException as exc:
+        return None, str(exc)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def api_get_health() -> tuple[dict | None, str | None]:
+    return _api_request("GET", "/health")
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def api_get_drift_report() -> tuple[dict | None, str | None]:
+    return _api_request("GET", "/drift-report")
+
+
+@st.cache_data(ttl=120, show_spinner="Calling the forecasting API…")
+def api_post_forecast(
+    sku_id: str, horizon_weeks: int, include_intervals: bool = True
+) -> tuple[dict | None, str | None]:
+    return _api_request(
+        "POST",
+        "/forecast",
+        json={"sku_id": sku_id, "horizon_weeks": horizon_weeks, "include_intervals": include_intervals},
+    )
+
 
 # ── theme / CSS ───────────────────────────────────────────────────────────────
 
@@ -115,13 +180,6 @@ def load_leaderboard() -> pd.DataFrame:
     df["coverage_80pct"] = df["coverage_80pct"].round(1)
     return df
 
-@st.cache_data(ttl=30, show_spinner=False)
-def load_drift_summary() -> dict | None:
-    reports = sorted((ROOT / "monitoring" / "evidently_reports").glob("drift_summary_*.json"))
-    if not reports:
-        return None
-    return json.loads(reports[-1].read_text())
-
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
@@ -144,12 +202,25 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    drift = load_drift_summary()
-    action = (drift or {}).get("action", "no_action")
-    badge_class = "badge-alert" if "retrain" in action else ("badge-warn" if "warning" in action else "badge-ok")
-    badge_label = "🔴 Retrain" if "retrain" in action else ("🟡 Warning" if "warning" in action else "🟢 Healthy")
+    drift_data, drift_err = api_get_drift_report()
+    if drift_data is not None:
+        action = drift_data.get("action", "no_action")
+        badge_class = "badge-alert" if "retrain" in action else ("badge-warn" if "warning" in action else "badge-ok")
+        badge_label = "🔴 Retrain" if "retrain" in action else ("🟡 Warning" if "warning" in action else "🟢 Healthy")
+    elif drift_err and drift_err.startswith("404"):
+        badge_class, badge_label = "badge-ok", "⚪ No drift data yet"
+    else:
+        badge_class, badge_label = "badge-warn", "🟡 API unreachable"
     st.markdown(f"**Model Status**  <span class='{badge_class}'>{badge_label}</span>", unsafe_allow_html=True)
-    st.caption("Production: QuantileLGBM v1\nWAPE: 34.9% | Coverage: 82.6%")
+
+    health, health_err = api_get_health()
+    if health is not None:
+        st.caption(
+            f"🟢 API online — {API_BASE_URL.removeprefix('https://').removeprefix('http://')}\n"
+            f"Model: {health.get('model_version') or 'none'} · Features: {health.get('feature_version') or 'none'}"
+        )
+    else:
+        st.caption(f"🔴 API unreachable\n{health_err}")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -310,19 +381,9 @@ elif page.endswith("Forecast Explorer"):
         mc3.markdown(f"**Lead time:** {sku_meta['lead_time_weeks']} weeks")
         mc4.markdown(f"**Unit cost:** ${sku_meta['unit_cost']:,.0f}")
 
-    # Build pseudo-forecast from rolling stats (real model needs MLflow)
-    last_rows = sku_data.tail(horizon).copy()
-    if "rolling_mean_4w" in last_rows.columns and "rolling_std_4w" in last_rows.columns:
-        p50 = last_rows["rolling_mean_4w"].fillna(last_rows["demand"].median())
-        std = last_rows["rolling_std_4w"].fillna(p50 * 0.12)
-        p10 = (p50 - 1.28 * std).clip(lower=0)
-        p90 = p50 + 1.28 * std
-        future_weeks = [last_rows["week"].max() + pd.Timedelta(weeks=h) for h in range(1, horizon + 1)]
-    else:
-        p50 = pd.Series([sku_data["demand"].median()] * horizon)
-        p10 = p50 * 0.7
-        p90 = p50 * 1.3
-        future_weeks = [sku_data["week"].max() + pd.Timedelta(weeks=h) for h in range(1, horizon + 1)]
+    # Real P10/P50/P90 forecast from the production model, served by the API
+    # (this used to be a pseudo-forecast approximated from rolling stats).
+    forecast_data, forecast_err = api_post_forecast(sku, horizon, include_intervals=True)
 
     fig = go.Figure()
 
@@ -351,34 +412,50 @@ elif page.endswith("Forecast Explorer"):
                 marker=dict(symbol="x", size=8, color="#f87171"),
             ))
 
-    # Forecast interval
-    forecast_x = list(future_weeks) + list(reversed(future_weeks))
-    forecast_y_band = list(p90.values) + list(reversed(p10.values))
-    fig.add_trace(go.Scatter(
-        x=forecast_x, y=forecast_y_band,
-        fill="toself", fillcolor="rgba(52,211,153,0.15)",
-        line=dict(color="rgba(0,0,0,0)"),
-        name="P10–P90 interval", hoverinfo="skip",
-    ))
-    fig.add_trace(go.Scatter(
-        x=future_weeks, y=p50.values,
-        name="P50 forecast", line=dict(color="#34d399", width=2.5, dash="dash"),
-        mode="lines+markers", marker=dict(size=5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=future_weeks, y=p10.values,
-        name="P10", line=dict(color="#34d399", width=1, dash="dot"),
-    ))
-    fig.add_trace(go.Scatter(
-        x=future_weeks, y=p90.values,
-        name="P90", line=dict(color="#34d399", width=1, dash="dot"),
-    ))
+    if forecast_err:
+        st.error(
+            f"Forecasting API unavailable — showing demand history only, no forecast. {forecast_err}"
+        )
+    else:
+        future_weeks = [pd.Timestamp(f["week"]) for f in forecast_data["forecasts"]]
+        p50 = pd.Series([f["p50"] for f in forecast_data["forecasts"]])
+        p10 = pd.Series([f["p10"] for f in forecast_data["forecasts"]])
+        p90 = pd.Series([f["p90"] for f in forecast_data["forecasts"]])
 
-    # Vertical divider at forecast start
-    split_week = sku_data["week"].max()
-    fig.add_vline(x=split_week, line=dict(color="#475569", dash="dash", width=1.5))
-    fig.add_annotation(x=split_week, yref="paper", y=0.95, text="Forecast →",
-                       showarrow=False, font=dict(color="#94a3b8", size=11))
+        # Forecast interval
+        forecast_x = list(future_weeks) + list(reversed(future_weeks))
+        forecast_y_band = list(p90.values) + list(reversed(p10.values))
+        fig.add_trace(go.Scatter(
+            x=forecast_x, y=forecast_y_band,
+            fill="toself", fillcolor="rgba(52,211,153,0.15)",
+            line=dict(color="rgba(0,0,0,0)"),
+            name="P10–P90 interval", hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=future_weeks, y=p50.values,
+            name="P50 forecast", line=dict(color="#34d399", width=2.5, dash="dash"),
+            mode="lines+markers", marker=dict(size=5),
+        ))
+        fig.add_trace(go.Scatter(
+            x=future_weeks, y=p10.values,
+            name="P10", line=dict(color="#34d399", width=1, dash="dot"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=future_weeks, y=p90.values,
+            name="P90", line=dict(color="#34d399", width=1, dash="dot"),
+        ))
+
+        # Vertical divider at forecast start
+        split_week = sku_data["week"].max()
+        fig.add_vline(x=split_week, line=dict(color="#475569", dash="dash", width=1.5))
+        fig.add_annotation(x=split_week, yref="paper", y=0.95, text="Forecast →",
+                           showarrow=False, font=dict(color="#94a3b8", size=11))
+
+        st.caption(
+            f"Served by API — model `{forecast_data.get('model_version')}` · "
+            f"features `{forecast_data.get('feature_version')}` · "
+            f"drift alert: {'🔴 yes' if forecast_data.get('drift_alert') else '🟢 no'}"
+        )
 
     fig.update_layout(
         title=f"{sku} — Demand History + {horizon}-Week Forecast",
@@ -505,20 +582,29 @@ elif page.endswith("Model Leaderboard"):
 
 elif page.endswith("Drift Monitor"):
     st.markdown("## Drift Monitor")
+    st.caption(f"Served by API — `GET {API_BASE_URL}/drift-report`")
 
-    drift = load_drift_summary()
+    drift, drift_err = api_get_drift_report()
     if drift is None:
-        st.warning("No drift reports found. Run `make drift-demo` to generate one.")
-        st.code("make drift-demo", language="bash")
+        if drift_err and drift_err.startswith("404"):
+            st.warning("No drift reports found yet. Run `make drift-demo` against the API's data to generate one.")
+        else:
+            st.error(f"Could not reach the drift report API: {drift_err}")
         st.stop()
 
     ts = drift.get("timestamp", "unknown")
     st.caption(f"Last checked: {ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]} UTC")
 
     action = drift.get("action", "no_action")
-    data_d  = drift.get("data_drift", {})
-    perf_d  = drift.get("performance_drift", {})
-    pred_d  = drift.get("prediction_drift", {})
+    # api/schemas.py::DriftReportResponse is a flatter shape than the local
+    # drift_summary_*.json this page used to read — map fields accordingly.
+    data_drift_status = drift.get("data_drift_status", "unknown")
+    drift_frac = drift.get("data_drift_fraction") or 0
+    pred_status = drift.get("prediction_drift_status", "unknown")
+    perf_status = drift.get("performance_drift_status", "unknown")
+    recent_wape = drift.get("current_wape")
+    base_wape = drift.get("baseline_wape") or 34.9
+    html_report_url = drift.get("html_report_url")
 
     # Action banner
     ACTION_STYLE = {
@@ -540,32 +626,23 @@ elif page.endswith("Drift Monitor"):
     c1, c2, c3 = st.columns(3)
 
     # Data drift
-    drift_frac = data_d.get("drift_fraction", 0)
     drift_pct = f"{drift_frac:.0%}"
-    d_status = data_d.get("status", "unknown")
-    d_badge = "badge-alert" if d_status == "retrain" else ("badge-warn" if d_status == "warning" else "badge-ok")
+    d_badge = "badge-alert" if data_drift_status == "retrain" else ("badge-warn" if data_drift_status == "warning" else "badge-ok")
     with c1:
         st.markdown("#### Data Drift")
-        st.markdown(f'<span class="{d_badge}">{d_status.upper()}</span>', unsafe_allow_html=True)
+        st.markdown(f'<span class="{d_badge}">{data_drift_status.upper()}</span>', unsafe_allow_html=True)
         st.metric("Features drifted", drift_pct, help="KS-test p < 0.05 → drifted")
         st.caption("Threshold: >30% warn · >50% retrain")
 
     # Prediction drift
-    p_status = pred_d.get("status", "unknown")
-    p_badge = "badge-alert" if p_status == "drift" else "badge-ok"
+    p_badge = "badge-alert" if pred_status == "drift" else "badge-ok"
     with c2:
         st.markdown("#### Prediction Drift")
-        st.markdown(f'<span class="{p_badge}">{p_status.upper()}</span>', unsafe_allow_html=True)
-        p_val = pred_d.get("p_value")
-        if p_val is not None:
-            st.metric("KS p-value", f"{p_val:.2e}", help="p < 0.05 → distributional shift")
+        st.markdown(f'<span class="{p_badge}">{pred_status.upper()}</span>', unsafe_allow_html=True)
         st.caption("P50 forecast distribution vs. reference")
 
     # Performance drift
-    perf_status = perf_d.get("status", "unknown")
     perf_badge = "badge-alert" if perf_status == "retrain" else "badge-ok"
-    recent_wape = perf_d.get("recent_wape")
-    base_wape   = perf_d.get("baseline_wape", 34.9)
     with c3:
         st.markdown("#### Performance Drift")
         st.markdown(f'<span class="{perf_badge}">{perf_status.upper()}</span>', unsafe_allow_html=True)
@@ -579,52 +656,31 @@ elif page.endswith("Drift Monitor"):
     st.markdown("---")
     st.markdown("### Feature Drift Status")
 
-    drifted_feats = data_d.get("drifted_features", {})
-    if drifted_feats:
-        feat_df = pd.DataFrame([
-            {"Feature": k, "Status": "🔴 DRIFTED" if v else "🟢 OK",
-             "Drifted": bool(v)}
-            for k, v in drifted_feats.items()
-        ])
-        n_drifted = feat_df["Drifted"].sum()
+    # Gauge chart — /drift-report gives the aggregate drift_fraction; the
+    # per-feature drifted/not-drifted breakdown isn't in that response, so
+    # it isn't shown here (see the full Evidently report link below instead).
+    fig_gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=drift_frac * 100,
+        title={"text": "% Features Drifted"},
+        gauge={
+            "axis": {"range": [0, 100], "tickfont": {"color": "#94a3b8"}},
+            "bar": {"color": "#f87171" if drift_frac > 0.5 else ("#fbbf24" if drift_frac > 0.3 else "#34d399")},
+            "steps": [
+                {"range": [0, 30],  "color": "#0f2d1a"},
+                {"range": [30, 50], "color": "#2d1c02"},
+                {"range": [50, 100], "color": "#2d0a0a"},
+            ],
+            "threshold": {"line": {"color": "#f87171", "width": 3}, "value": 50},
+        },
+        number={"suffix": "%", "font": {"size": 28}},
+    ))
+    fig_gauge.update_layout(height=230, margin=dict(t=40, b=0, l=20, r=20), **PLOTLY_THEME)
+    st.plotly_chart(fig_gauge, use_container_width=True)
+    st.caption("Per-feature drift status isn't exposed by /drift-report — see the full report below for the breakdown.")
 
-        # Gauge chart
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=drift_frac * 100,
-            title={"text": "% Features Drifted"},
-            gauge={
-                "axis": {"range": [0, 100], "tickfont": {"color": "#94a3b8"}},
-                "bar": {"color": "#f87171" if drift_frac > 0.5 else ("#fbbf24" if drift_frac > 0.3 else "#34d399")},
-                "steps": [
-                    {"range": [0, 30],  "color": "#0f2d1a"},
-                    {"range": [30, 50], "color": "#2d1c02"},
-                    {"range": [50, 100], "color": "#2d0a0a"},
-                ],
-                "threshold": {"line": {"color": "#f87171", "width": 3}, "value": 50},
-            },
-            number={"suffix": "%", "font": {"size": 28}},
-        ))
-        fig_gauge.update_layout(height=230, margin=dict(t=40, b=0, l=20, r=20), **PLOTLY_THEME)
-
-        gc1, gc2 = st.columns([1, 2])
-        with gc1:
-            st.plotly_chart(fig_gauge, use_container_width=True)
-        with gc2:
-            st.dataframe(
-                feat_df[["Feature", "Status"]].style.apply(
-                    lambda row: ["color:#f87171" if "DRIFTED" in row["Status"] else "color:#34d399"] * 2,
-                    axis=1,
-                ),
-                use_container_width=True,
-                hide_index=True,
-                height=200,
-            )
-
-    if data_d.get("html_report"):
-        report_path = Path(data_d["html_report"])
-        if report_path.exists():
-            st.markdown(f"📄 **Full Evidently report:** `{report_path.name}`  \nOpen from `monitoring/evidently_reports/`")
+    if html_report_url:
+        st.markdown(f"📄 **Full Evidently report:** [{html_report_url}]({API_BASE_URL}{html_report_url})")
 
     # Performance timeline (simulated: baseline vs shocked)
     st.markdown("---")

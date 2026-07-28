@@ -6,5 +6,6 @@ scikit-learn>=1.4.2
 mlflow>=2.11.3
 streamlit>=1.32.2
 plotly>=5.20.0
+requests>=2.31.0
 python-dotenv==1.0.1
 rich==13.7.1
